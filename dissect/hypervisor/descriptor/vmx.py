@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
-import re
 from urllib.parse import unquote
 
 try:
@@ -40,6 +40,30 @@ PASS2KEY_MAP = {
     "PBKDF2-HMAC-SHA-1": "sha1",
     "PBKDF2-HMAC-SHA-256": "sha256",
 }
+
+
+class KeySafeError(ValueError):
+    """Base class for all errors while parsing or unsealing a ``KeySafe``.
+
+    Subclasses remain :class:`ValueError` subclasses so existing callers that catch
+    ``ValueError`` keep working, while callers can distinguish the failure cause.
+    """
+
+
+class KeySafeSyntaxError(KeySafeError):
+    """Raised when a key locator string is structurally malformed."""
+
+
+class KeySafeFieldError(KeySafeError):
+    """Raised when a locator contains a missing, unknown or otherwise invalid field."""
+
+
+class InvalidPassphraseError(KeySafeError):
+    """Raised when no locator can be unsealed with the given passphrase."""
+
+
+class InvalidMacError(KeySafeError):
+    """Raised when decrypted data fails its HMAC verification."""
 
 
 class VMX:
@@ -161,6 +185,7 @@ class KeySafe:
 
     def unseal_with_phrase(self, passphrase: str) -> bytes:
         """Unseal this ``KeySafe`` with a passphrase and return the decrypted key."""
+        last_error: Exception | None = None
         for locator in self.locators:
             if not locator.has_phrase():
                 continue
@@ -171,23 +196,25 @@ class KeySafe:
                 # type=key:cipher=AES-256:key=base64value'
                 crypto_dict = _parse_crypto_dict(data.decode())
                 return base64.b64decode(crypto_dict["key"]), locator.mac
-            except ValueError:
-                pass
+            except (KeySafeError, binascii.Error, KeyError) as exc:
+                # A wrong passphrase makes the HMAC check fail; a corrupted payload
+                # raises the same way. Both simply mean this locator did not unlock.
+                last_error = exc
 
-        raise ValueError("No compatible locator")
+        raise InvalidPassphraseError("No compatible locator could be unsealed with this passphrase") from last_error
 
     @classmethod
     def from_text(cls, text: str) -> KeySafe:
         """Parse a ``KeySafe`` from a string."""
         # Key safes are a list of key locators. It's a key locator string with a specific prefix
-        identifier, _, remainder = text.partition("/")
-        if identifier != "vmware:key":
-            raise ValueError("Invalid KeySafe string, wrong identifier")
+        identifier, separator, remainder = text.partition("/")
+        if identifier != "vmware:key" or not separator:
+            raise KeySafeSyntaxError("Invalid KeySafe string, wrong identifier")
 
         # First part must be a list of pairs
         locators = _parse_key_locator(remainder)
-        if not isinstance(locators, list) and not all(isinstance(member, Pair) for member in locators):
-            raise ValueError("Invalid KeySafe string, not a list of pairs")
+        if not isinstance(locators, list) or not locators or not all(isinstance(member, Pair) for member in locators):
+            raise KeySafeSyntaxError("Invalid KeySafe string, not a list of pairs")
 
         return KeySafe(locators)
 
@@ -261,35 +288,67 @@ def _parse_key_locator(locator_string: str) -> Pair | Phrase | list[Pair | Phras
 
     Interally called ``KeyLocator``.
     """
-    identifier, _, remainder = locator_string.partition("/")
+    identifier, separator, remainder = locator_string.partition("/")
 
     if identifier == "list":
         # Comma separated list in between braces
         # list/(member,member)
         return [_parse_key_locator(member) for member in _split_list(remainder)]
 
+    if not separator or not identifier:
+        raise KeySafeSyntaxError(f"Empty or malformed key locator: {locator_string!r}")
+
     if identifier == "pair":
         # Comma separated tuple with 3 members
         # pair/(key data,mac type,encrypted data)
         members = _split_list(remainder)
-        return Pair(
-            _parse_key_locator(members[0]),
-            unquote(members[1]),
-            base64.b64decode(unquote(members[2])),
-        )
+        if len(members) != 3:
+            raise KeySafeSyntaxError(f"pair locator requires exactly 3 members, got {len(members)}")
+
+        wrapped_key = _parse_key_locator(members[0])
+        if not isinstance(wrapped_key, Phrase):
+            raise KeySafeSyntaxError("pair locator must wrap a supported key (currently only phrase)")
+
+        mac = unquote(members[1])
+        if mac not in HMAC_MAP:
+            raise KeySafeFieldError(f"Unknown or missing HMAC type: {mac!r}")
+
+        try:
+            data = base64.b64decode(unquote(members[2]), validate=True)
+        except binascii.Error as exc:
+            raise KeySafeFieldError("pair locator data is not valid base64") from exc
+
+        # Layout: 16 byte IV, at least one AES block of ciphertext, trailing HMAC.
+        if len(data) < 16 + 16 + HMAC_MAP[mac][1]:
+            raise KeySafeFieldError("pair locator data is too short to contain IV, ciphertext and HMAC")
+
+        return Pair(wrapped_key, mac, data)
 
     if identifier == "phrase":
         # Serialized crypto dict, prefixed with an identifier
         # phrase/encoded id/encoded dict
         phrase_id, _, phrase_data = remainder.partition("/")
-        crypto_dict = _parse_crypto_dict(unquote(phrase_data))
-        return Phrase(
-            unquote(phrase_id),
-            crypto_dict["pass2key"],
-            crypto_dict["cipher"],
-            int(crypto_dict["rounds"]),
-            base64.b64decode(crypto_dict["salt"]),
-        )
+        phrase_id = unquote(phrase_id)
+        if not phrase_id:
+            raise KeySafeSyntaxError("phrase locator requires a non-empty identifier")
+
+        try:
+            crypto_dict = _parse_crypto_dict(unquote(phrase_data))
+            pass2key = crypto_dict["pass2key"]
+            cipher = crypto_dict["cipher"]
+            rounds = int(crypto_dict["rounds"])
+            salt = base64.b64decode(crypto_dict["salt"], validate=True)
+        except (KeyError, binascii.Error, ValueError) as exc:
+            raise KeySafeFieldError(f"phrase locator has a missing or invalid field: {exc}") from exc
+
+        if pass2key not in PASS2KEY_MAP:
+            raise KeySafeFieldError(f"Unknown pass2key algorithm: {pass2key!r}")
+        if cipher not in CIPHER_KEY_SIZES:
+            raise KeySafeFieldError(f"Unknown cipher: {cipher!r}")
+        if rounds <= 0:
+            raise KeySafeFieldError(f"rounds must be a positive integer, got {rounds}")
+
+        return Phrase(phrase_id, pass2key, cipher, rounds, salt)
 
     # rawkey, ldap, script, role, fqid
     raise NotImplementedError(f"Not implemented keysafe identifier: {identifier}")
@@ -299,30 +358,55 @@ def _split_list(value: str) -> list[str]:
     """Parse a key locator list from a string.
 
     Lists are wrapped by braces and separated by comma. They can contain nested lists/pairs,
-    so we need to separate at the correct nest level.
+    so we need to separate at the correct nest level. The whole string must be a single
+    balanced parenthesized group; any trailing fragment or unbalanced brace is rejected so it
+    cannot be silently interpreted as structure.
     """
-    if not (match := re.match(r"\((.+)\)", value)):
-        raise ValueError("Invalid list string")
+    if not value.startswith("("):
+        raise KeySafeSyntaxError("Invalid list string, missing opening brace")
 
-    contents = match.group(1)
+    # Validate that the string is exactly one balanced parenthesized group.
+    stack: list[int] = []
+    for index, char in enumerate(value):
+        if char == "(":
+            stack.append(index)
+        elif char == ")":
+            if not stack:
+                raise KeySafeSyntaxError("Invalid list string, unbalanced closing brace")
+            stack.pop()
+            if not stack and index != len(value) - 1:
+                raise KeySafeSyntaxError("Invalid list string, trailing fragment after closing brace")
+    if stack:
+        raise KeySafeSyntaxError("Invalid list string, unbalanced opening brace")
+
+    contents = value[1:-1]
+    if not contents:
+        return []
 
     buf = ""
     members = []
-    level = 0
+    nested = 0
     for char in contents:
         if char == "(":
-            level += 1
+            nested += 1
+            buf += char
         elif char == ")":
-            level -= 1
-        elif char == "," and level == 0:
+            nested -= 1
+            if nested < 0:
+                raise KeySafeSyntaxError("Invalid list string, unbalanced closing brace")
+            buf += char
+        elif char == "," and nested == 0:
             members.append(buf)
             buf = ""
-            continue
+        else:
+            buf += char
 
-        buf += char
+    if nested != 0:
+        raise KeySafeSyntaxError("Invalid list string, unbalanced opening brace")
+    members.append(buf)
 
-    if buf:
-        members.append(buf)
+    if any(not member for member in members):
+        raise KeySafeSyntaxError("Invalid list string, empty list member")
 
     return members
 
@@ -347,7 +431,10 @@ def _decrypt_hmac(key: bytes, data: bytes, digest: str) -> bytes:
     First 16 bytes of the ciphertext are the IV and the last N bytes are the HMAC digest.
     The cleartext is padded using PKCS#7.
     """
-    digest, digest_size = HMAC_MAP[digest]
+    try:
+        digest, digest_size = HMAC_MAP[digest]
+    except KeyError as exc:
+        raise KeySafeFieldError(f"Unknown HMAC type: {digest!r}") from exc
 
     iv, encrypted, mac = data[:16], data[16:-digest_size], data[-digest_size:]
     cipher = _create_cipher(key, iv)
@@ -359,7 +446,7 @@ def _decrypt_hmac(key: bytes, data: bytes, digest: str) -> bytes:
 
     # We don't do any secret crypto so we don't care about the warning in the docs about timing attacks
     if hmac.digest(key, decrypted, digest) != mac:
-        raise ValueError("Invalid HMAC, wrong key?")
+        raise InvalidMacError("Invalid HMAC, the key or payload does not match")
 
     return decrypted
 
