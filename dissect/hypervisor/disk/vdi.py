@@ -118,7 +118,7 @@ class VDIStream(AlignedStream):
 
         block_idx, offset_in_block = divmod(offset, self.block_size)
         while length > 0:
-            read_len = min(length, max(length, self.block_size - offset_in_block))
+            read_len = min(length, self.block_size - offset_in_block)
 
             block = self.map[block_idx]
             if block == VDI_IMAGE_BLOCK_FREE:
@@ -136,5 +136,6 @@ class VDIStream(AlignedStream):
             offset += read_len
             length -= read_len
             block_idx += 1
+            offset_in_block = 0
 
         return b"".join(result)
