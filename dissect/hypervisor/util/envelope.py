@@ -5,10 +5,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
+import os
+import tempfile
 from base64 import b64decode
-from typing import BinaryIO, NamedTuple
+from typing import BinaryIO, Iterator, NamedTuple
 from urllib.parse import unquote
 from uuid import UUID
 
@@ -96,6 +99,8 @@ ENVELOPE_ATTRIBUTE_TYPE_MAP = {
 }
 
 DECRYPT_CHUNK_SIZE = 1024 * 1024 * 4
+CRYPTO_FOOTER_SIZE = c_envelope.DataTransformCryptoFooter.size
+_SPOOL_SUFFIX = ".ve-decrypted"
 
 
 class EnvelopeAttribute(NamedTuple):
@@ -149,36 +154,15 @@ class Envelope:
     def decrypt(self, key: bytes, aad: bytes | None = None) -> bytes:
         """Decrypt the data in this envelope.
 
+        This buffers the entire decrypted payload in memory. For large envelopes
+        prefer :meth:`decrypt_stream`, which keeps memory bounded regardless of the
+        envelope size and only exposes plaintext after authentication succeeds.
+
         Arguments:
             key: decryption key to use
             aad: optional associated data to include for AEAD ciphers
         """
-        if not HAS_PYSTANDALONE and not HAS_PYCRYPTODOME:
-            raise RuntimeError("No crypto module available")
-
-        key_hash = hashlib.sha256(self.cipher_name.encode() + key).digest()
-        if key_hash != self.key_hash:
-            raise ValueError("Key hash doesn't match")
-
-        is_aead = False
-        if self.cipher_name == "AES-256-GCM":
-            is_aead = True
-
-            if not self.iv:
-                raise ValueError("Missing IV")
-
-            if HAS_PYSTANDALONE:
-                cipher = _pystandalone.aes_256_gcm(key, self.iv)
-            else:
-                cipher = AES.new(key, AES.MODE_GCM, nonce=self.iv)
-        else:
-            raise NotImplementedError(f"Unsupported cipher: {self.cipher_name}")
-
-        if is_aead:
-            # The file header is included in the AAD, as well as any optional variable data
-            cipher.update(_pack_envelope_header(self))
-            if aad:
-                cipher.update(aad)
+        cipher = self._new_cipher(key, aad)
 
         self.data.seek(0)
         offset = 0
@@ -192,13 +176,126 @@ class Envelope:
             decrypted[offset : offset + chunk_size] = cipher.decrypt(chunk)
             offset += chunk_size
 
-        footer = c_envelope.DataTransformCryptoFooter(bytes(decrypted[-512:]))
-        decrypted = decrypted[: -4096 - footer.padding]
+        footer = c_envelope.DataTransformCryptoFooter(bytes(decrypted[-CRYPTO_FOOTER_SIZE:]))
+        decrypted = decrypted[: -ENVELOPE_BLOCK_SIZE - footer.padding]
 
         if self.verify:
             cipher.verify(self.digest)
 
         return bytes(decrypted)
+
+    @contextlib.contextmanager
+    def decrypt_stream(
+        self, key: bytes, aad: bytes | None = None, *, tmp_dir: str | None = None
+    ) -> Iterator[BinaryIO]:
+        """Stream-decrypt this envelope using bounded memory.
+
+        The envelope is decrypted in fixed-size chunks into a temporary file, so
+        memory usage stays bounded by :data:`DECRYPT_CHUNK_SIZE` instead of growing
+        with the envelope size. Authentication is completed before any plaintext is
+        handed out:
+
+        1. the GCM tag (``self.digest``), the packed file header AAD and the optional
+           ``aad`` are verified while streaming;
+        2. the encrypted :class:`DataTransformCryptoFooter` is parsed and validated;
+        3. only then is the temporary file truncated to the verified payload length
+           and yielded as a readable, seekable binary stream positioned at the start.
+
+        On any failure (short read, failed GCM/AAD verification, invalid footer or
+        padding, or an error while writing the temporary file) the temporary file is
+        closed and deleted and the exception propagates, so unauthenticated plaintext
+        never leaves this context manager. The temporary file is likewise removed when
+        the ``with`` block exits.
+
+        Arguments:
+            key: decryption key to use
+            aad: optional associated data to include for AEAD ciphers
+            tmp_dir: optional directory for the temporary file (defaults to the
+                operating system's temporary directory)
+
+        Yields:
+            A seekable binary stream containing the authenticated plaintext.
+        """
+        cipher = self._new_cipher(key, aad)
+
+        spool, spool_path = _open_spool(tmp_dir)
+        try:
+            # Keep only the final CRYPTO_FOOTER_SIZE bytes, which hold the crypto
+            # footer (the last block is padded with random data). This rolling window
+            # never grows beyond CRYPTO_FOOTER_SIZE, regardless of envelope size.
+            tail = bytearray()
+            total = 0
+
+            self.data.seek(0)
+            while True:
+                chunk = self.data.read(DECRYPT_CHUNK_SIZE)
+                if not chunk:
+                    break
+
+                plain = cipher.decrypt(chunk)
+                spool.write(plain)
+                total += len(plain)
+
+                tail.extend(plain)
+                if len(tail) > CRYPTO_FOOTER_SIZE:
+                    del tail[: len(tail) - CRYPTO_FOOTER_SIZE]
+
+            # A truncated envelope normally fails the GCM tag, but detect a short
+            # read explicitly so callers get an unambiguous error.
+            if total != self.size:
+                raise ValueError(
+                    f"Short read in envelope data: expected {self.size} bytes, got {total} bytes"
+                )
+
+            # Verify the GCM tag before validating or exposing any plaintext.
+            if self.verify:
+                cipher.verify(self.digest)
+
+            footer = c_envelope.DataTransformCryptoFooter(bytes(tail))
+            if footer.magic != FOOTER_CRYPTO_MAGIC:
+                raise ValueError("Invalid crypto footer")
+
+            overhead = ENVELOPE_BLOCK_SIZE + footer.padding
+            if overhead > total:
+                raise ValueError(f"Invalid crypto footer padding: {footer.padding}")
+
+            # Authentication has succeeded; drop the padding and final block so the
+            # yielded stream only contains the verified payload.
+            spool.truncate(total - overhead)
+            spool.flush()
+            spool.seek(0)
+            yield spool
+        finally:
+            spool.close()
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(spool_path)
+
+    def _new_cipher(self, key: bytes, aad: bytes | None = None):
+        """Build an initialized AEAD cipher and feed it the envelope AAD."""
+        if not HAS_PYSTANDALONE and not HAS_PYCRYPTODOME:
+            raise RuntimeError("No crypto module available")
+
+        key_hash = hashlib.sha256(self.cipher_name.encode() + key).digest()
+        if key_hash != self.key_hash:
+            raise ValueError("Key hash doesn't match")
+
+        if self.cipher_name != "AES-256-GCM":
+            raise NotImplementedError(f"Unsupported cipher: {self.cipher_name}")
+
+        if not self.iv:
+            raise ValueError("Missing IV")
+
+        if HAS_PYSTANDALONE:
+            cipher = _pystandalone.aes_256_gcm(key, self.iv)
+        else:
+            cipher = AES.new(key, AES.MODE_GCM, nonce=self.iv)
+
+        # The file header is included in the AAD, as well as any optional variable data
+        cipher.update(_pack_envelope_header(self))
+        if aad:
+            cipher.update(aad)
+
+        return cipher
 
 
 class KeyStore:
@@ -270,6 +367,16 @@ class KeyStore:
                 node[parts[-1]] = value.strip(' "')
 
         return cls(store)
+
+
+def _open_spool(tmp_dir: str | None = None) -> tuple[BinaryIO, str]:
+    """Create a named temporary file used to spool decrypted data.
+
+    The file is created in the most restrictive mode (``0o600``) and is unlinked by
+    :meth:`Envelope.decrypt_stream` in its ``finally`` block.
+    """
+    fd, path = tempfile.mkstemp(suffix=_SPOOL_SUFFIX, dir=tmp_dir)
+    return os.fdopen(fd, "w+b"), path
 
 
 def _read_envelope_attributes(buf: BinaryIO) -> dict[str, EnvelopeAttribute]:

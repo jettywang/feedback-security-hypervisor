@@ -22,7 +22,12 @@ def main() -> int:
         keystore = KeyStore.from_text(args.keystore.read_text())
 
         with args.output.open("wb") as fhout:
-            fhout.write(envelope.decrypt(keystore.key))
+            with envelope.decrypt_stream(keystore.key) as decrypted:
+                while True:
+                    chunk = decrypted.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    fhout.write(chunk)
 
     return 0
 
