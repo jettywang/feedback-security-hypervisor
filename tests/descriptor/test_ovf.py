@@ -168,3 +168,180 @@ TEST_OVF = """<?xml version="1.0"?>
 def test_ovf() -> None:
     ovf = OVF(StringIO(TEST_OVF))
     assert list(ovf.disks()) == ["disk1.vmdk", "disk2.vmdk", "disk3.vmdk"]
+
+
+# Handcrafted VirtualSystemCollection with two systems sharing a disk,
+# plus edge cases: direct file reference, empty disk, duplicate and missing ids.
+TEST_OVF_COLLECTION = """<?xml version="1.0"?>
+<Envelope ovf:version="1.0" xml:lang="en-US" xmlns="http://schemas.dmtf.org/ovf/envelope/1" xmlns:ovf="http://schemas.dmtf.org/ovf/envelope/1" xmlns:rasd="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_ResourceAllocationSettingData">
+  <References>
+    <File ovf:id="file1" ovf:href="vm1-boot.vmdk"/>
+    <File ovf:id="file2" ovf:href="shared-data.vmdk"/>
+    <File ovf:id="file3" ovf:href="vm2-boot.vmdk"/>
+    <File ovf:id="file4" ovf:href="tools.iso"/>
+    <File ovf:id="file5" ovf:href="https://example.com/remote.vmdk"/>
+    <File ovf:id="filedup" ovf:href="dup-a.vmdk"/>
+    <File ovf:id="filedup" ovf:href="dup-b.vmdk"/>
+    <File ovf:href="orphan.vmdk"/>
+  </References>
+  <DiskSection>
+    <Info>List of the virtual disks used in the package</Info>
+    <Disk ovf:capacity="1024" ovf:diskId="vmdisk1" ovf:fileRef="file1"/>
+    <Disk ovf:capacity="1024" ovf:diskId="vmdisk2" ovf:fileRef="file2"/>
+    <Disk ovf:capacity="1024" ovf:diskId="vmdisk3" ovf:fileRef="file3"/>
+    <Disk ovf:capacity="1024" ovf:diskId="vmdisk4"/>
+    <Disk ovf:capacity="1024" ovf:diskId="vmdiskdup" ovf:fileRef="filedup"/>
+    <Disk ovf:capacity="1024" ovf:diskId="vmdiskdup" ovf:fileRef="file1"/>
+    <Disk ovf:capacity="1024" ovf:diskId="vmdisk-missing" ovf:fileRef="file-missing"/>
+  </DiskSection>
+  <VirtualSystemCollection ovf:id="collection">
+    <Info>Two appliances sharing a data disk</Info>
+    <VirtualSystem ovf:id="vm1">
+      <Info>First virtual machine</Info>
+      <VirtualHardwareSection>
+        <Info>Virtual hardware requirements for a virtual machine</Info>
+        <Item>
+          <rasd:Caption>scsiController0</rasd:Caption>
+          <rasd:Description>SCSI Controller</rasd:Description>
+          <rasd:ElementName>scsiController0</rasd:ElementName>
+          <rasd:InstanceID>3</rasd:InstanceID>
+          <rasd:ResourceType>20</rasd:ResourceType>
+        </Item>
+        <Item>
+          <rasd:AddressOnParent>0</rasd:AddressOnParent>
+          <rasd:Caption>disk1</rasd:Caption>
+          <rasd:HostResource>ovf:/disk/vmdisk1</rasd:HostResource>
+          <rasd:InstanceID>4</rasd:InstanceID>
+          <rasd:Parent>3</rasd:Parent>
+          <rasd:ResourceType>17</rasd:ResourceType>
+        </Item>
+        <Item>
+          <rasd:AddressOnParent>1</rasd:AddressOnParent>
+          <rasd:Caption>disk2</rasd:Caption>
+          <rasd:HostResource>ovf:/disk/vmdisk2</rasd:HostResource>
+          <rasd:InstanceID>5</rasd:InstanceID>
+          <rasd:Parent>3</rasd:Parent>
+          <rasd:ResourceType>17</rasd:ResourceType>
+        </Item>
+        <Item>
+          <rasd:AddressOnParent>2</rasd:AddressOnParent>
+          <rasd:Caption>disk3</rasd:Caption>
+          <rasd:HostResource>ovf:/disk/vmdisk4</rasd:HostResource>
+          <rasd:InstanceID>6</rasd:InstanceID>
+          <rasd:Parent>3</rasd:Parent>
+          <rasd:ResourceType>17</rasd:ResourceType>
+        </Item>
+        <Item>
+          <rasd:AddressOnParent>3</rasd:AddressOnParent>
+          <rasd:Caption>disk4</rasd:Caption>
+          <rasd:HostResource>ovf:/disk/vmdiskdup</rasd:HostResource>
+          <rasd:InstanceID>7</rasd:InstanceID>
+          <rasd:Parent>3</rasd:Parent>
+          <rasd:ResourceType>17</rasd:ResourceType>
+        </Item>
+        <Item>
+          <rasd:AddressOnParent>4</rasd:AddressOnParent>
+          <rasd:Caption>cdrom1</rasd:Caption>
+          <rasd:HostResource>ovf:/file/file4</rasd:HostResource>
+          <rasd:InstanceID>8</rasd:InstanceID>
+          <rasd:Parent>3</rasd:Parent>
+          <rasd:ResourceType>17</rasd:ResourceType>
+        </Item>
+      </VirtualHardwareSection>
+    </VirtualSystem>
+    <VirtualSystem ovf:id="vm2">
+      <Info>Second virtual machine</Info>
+      <VirtualHardwareSection>
+        <Info>Virtual hardware requirements for a virtual machine</Info>
+        <Item>
+          <rasd:Caption>sataController0</rasd:Caption>
+          <rasd:Description>SATA Controller</rasd:Description>
+          <rasd:ElementName>sataController0</rasd:ElementName>
+          <rasd:InstanceID>3</rasd:InstanceID>
+          <rasd:ResourceType>20</rasd:ResourceType>
+        </Item>
+        <Item>
+          <rasd:AddressOnParent>0</rasd:AddressOnParent>
+          <rasd:Caption>disk1</rasd:Caption>
+          <rasd:HostResource>ovf:/disk/vmdisk3</rasd:HostResource>
+          <rasd:InstanceID>4</rasd:InstanceID>
+          <rasd:Parent>3</rasd:Parent>
+          <rasd:ResourceType>17</rasd:ResourceType>
+        </Item>
+        <Item>
+          <rasd:AddressOnParent>1</rasd:AddressOnParent>
+          <rasd:Caption>disk2</rasd:Caption>
+          <rasd:HostResource>ovf:/disk/vmdisk2</rasd:HostResource>
+          <rasd:InstanceID>5</rasd:InstanceID>
+          <rasd:Parent>3</rasd:Parent>
+          <rasd:ResourceType>17</rasd:ResourceType>
+        </Item>
+        <Item>
+          <rasd:AddressOnParent>2</rasd:AddressOnParent>
+          <rasd:Caption>disk3</rasd:Caption>
+          <rasd:HostResource>ovf:/disk/vmdisk-missing</rasd:HostResource>
+          <rasd:InstanceID>6</rasd:InstanceID>
+          <rasd:Parent>3</rasd:Parent>
+          <rasd:ResourceType>17</rasd:ResourceType>
+        </Item>
+        <Item>
+          <rasd:AddressOnParent>3</rasd:AddressOnParent>
+          <rasd:Caption>disk4</rasd:Caption>
+          <rasd:HostResource>ovf:/file/file5</rasd:HostResource>
+          <rasd:InstanceID>7</rasd:InstanceID>
+          <rasd:Parent>3</rasd:Parent>
+          <rasd:ResourceType>17</rasd:ResourceType>
+        </Item>
+      </VirtualHardwareSection>
+    </VirtualSystem>
+  </VirtualSystemCollection>
+</Envelope>
+"""  # noqa
+
+
+def test_ovf_virtual_system_collection() -> None:
+    ovf = OVF(StringIO(TEST_OVF_COLLECTION))
+    systems = dict(ovf.systems())
+    assert list(systems) == ["vm1", "vm2"]
+
+    vm1 = systems["vm1"]
+    assert [(m.controller, m.address, m.disk_id, m.file_id, m.href) for m in vm1] == [
+        ("scsiController0", "0", "vmdisk1", "file1", "vm1-boot.vmdk"),
+        ("scsiController0", "1", "vmdisk2", "file2", "shared-data.vmdk"),
+        # Empty disk without a backing file.
+        ("scsiController0", "2", "vmdisk4", None, None),
+        # Ambiguous: "vmdiskdup" is defined twice in the DiskSection.
+        ("scsiController0", "3", "vmdiskdup", None, None),
+        # Direct file reference, no DiskSection entry involved.
+        ("scsiController0", "4", None, "file4", "tools.iso"),
+    ]
+    assert vm1[2].error is None
+    assert "ambiguous disk id 'vmdiskdup'" in vm1[3].error
+
+    vm2 = systems["vm2"]
+    assert [(m.controller, m.address, m.disk_id, m.file_id, m.href) for m in vm2] == [
+        ("sataController0", "0", "vmdisk3", "file3", "vm2-boot.vmdk"),
+        # The shared disk maps to the same evidence file as in vm1.
+        ("sataController0", "1", "vmdisk2", "file2", "shared-data.vmdk"),
+        # The referenced file id "file-missing" is not defined.
+        ("sataController0", "2", "vmdisk-missing", "file-missing", None),
+        # External references are reported but never dereferenced.
+        ("sataController0", "3", None, "file5", "https://example.com/remote.vmdk"),
+    ]
+    assert "unknown file id 'file-missing'" in vm2[2].error
+    assert vm2[3].error is None
+
+    # Duplicate and anonymous ids are reported on the OVF level.
+    assert ovf.duplicate_file_ids == {"filedup"}
+    assert ovf.duplicate_disk_ids == {"vmdiskdup"}
+    assert ovf.anonymous_files == ["orphan.vmdk"]
+
+    # The shared disk shows up once per system, empty and unresolvable disks are skipped.
+    assert list(ovf.disks()) == [
+        "vm1-boot.vmdk",
+        "shared-data.vmdk",
+        "tools.iso",
+        "vm2-boot.vmdk",
+        "shared-data.vmdk",
+        "https://example.com/remote.vmdk",
+    ]
