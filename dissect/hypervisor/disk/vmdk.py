@@ -8,6 +8,7 @@ import re
 import textwrap
 import zlib
 from bisect import bisect_right
+from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -27,9 +28,25 @@ log = logging.getLogger(__name__)
 log.setLevel(os.getenv("DISSECT_LOG_VMDK", "CRITICAL"))
 
 
+class ParentChainError(IOError):
+    """Raised when a VMDK parent chain cannot be resolved in a trustworthy manner."""
+
+
 class VMDK(AlignedStream):
-    def __init__(self, fh: BinaryIO | Path | str | list[BinaryIO | Path | str]):
-        """Input can be a file handle to a Disk Descriptor file or a list of file handles to multiple VMDK files."""
+    def __init__(
+        self,
+        fh: BinaryIO | Path | str | list[BinaryIO | Path | str],
+        *,
+        parent_candidates: Iterable[Path | str] | None = None,
+        _chain: tuple[str, ...] = (),
+    ):
+        """Input can be a file handle to a Disk Descriptor file or a list of file handles to multiple VMDK files.
+
+        Args:
+            parent_candidates: Optional caller-supplied evidence files to resolve parent disks from.
+                When given, parents are matched by CID against these candidates instead of being
+                guessed by file name.
+        """
         fhs = [fh] if not isinstance(fh, list) else fh
 
         self.disks = []
@@ -37,45 +54,75 @@ class VMDK(AlignedStream):
         self.descriptor = None
         self._disk_offsets = []
         self.sector_count = 0
+        self._opened_fhs = []
 
-        for fh in fhs:
-            if hasattr(fh, "read"):
-                name = getattr(fh, "name", None)
-                path = Path(name) if name else None
-            else:
-                if not isinstance(fh, Path):
-                    fh = Path(fh)
-                path = fh
-                fh = path.open("rb")
+        try:
+            for fh in fhs:
+                if hasattr(fh, "read"):
+                    name = getattr(fh, "name", None)
+                    path = Path(name) if name else None
+                else:
+                    if not isinstance(fh, Path):
+                        fh = Path(fh)
+                    path = fh
+                    fh = path.open("rb")
+                    self._opened_fhs.append(fh)
 
-            magic = fh.read(4)
-            fh.seek(-4, io.SEEK_CUR)
+                magic = fh.read(4)
+                fh.seek(-4, io.SEEK_CUR)
 
-            if magic == b"# Di" and len(fhs) == 1:
-                # Try reading the disk files from this descriptor
-                # Otherwise we assume that the other file handles are the appropriate disks
-                self.descriptor = DiskDescriptor.parse(fh.read().decode())
+                if magic == b"# Di" and len(fhs) == 1:
+                    # Try reading the disk files from this descriptor
+                    # Otherwise we assume that the other file handles are the appropriate disks
+                    self.descriptor = DiskDescriptor.parse(fh.read().decode())
 
-                if self.descriptor.attr["parentCID"] != "ffffffff":
-                    self.parent = open_parent(path.parent, self.descriptor.attr["parentFileNameHint"])
+                    if self.descriptor.attr["parentCID"] != "ffffffff":
+                        self.parent = open_parent(
+                            path.parent,
+                            self.descriptor.attr["parentFileNameHint"],
+                            parent_cid=self.descriptor.attr["parentCID"],
+                            child_cid=self.descriptor.attr.get("CID"),
+                            candidates=parent_candidates,
+                            _chain=_chain,
+                        )
 
-                for extent in self.descriptor.extents:
-                    if extent.type in ["SPARSE", "VMFSSPARSE", "SESPARSE"]:
-                        sdisk_fh = path.with_name(extent.filename).open("rb")
-                        self.disks.append(SparseDisk(sdisk_fh, parent=self.parent))
-                    elif extent.type in ["VMFS", "FLAT"]:
-                        rdisk_fh = path.with_name(extent.filename).open("rb")
-                        self.disks.append(RawDisk(rdisk_fh, extent.sectors * SECTOR_SIZE))
+                    for extent in self.descriptor.extents:
+                        if extent.type in ["SPARSE", "VMFSSPARSE", "SESPARSE"]:
+                            sdisk_fh = path.with_name(extent.filename).open("rb")
+                            self._opened_fhs.append(sdisk_fh)
+                            self.disks.append(SparseDisk(sdisk_fh, parent=self.parent))
+                        elif extent.type in ["VMFS", "FLAT"]:
+                            rdisk_fh = path.with_name(extent.filename).open("rb")
+                            self._opened_fhs.append(rdisk_fh)
+                            self.disks.append(RawDisk(rdisk_fh, extent.sectors * SECTOR_SIZE))
 
-            elif magic in (COWD_MAGIC, VMDK_MAGIC, SESPARSE_MAGIC):
-                sparse_disk = SparseDisk(fh)
+                elif magic in (COWD_MAGIC, VMDK_MAGIC, SESPARSE_MAGIC):
+                    sparse_disk = SparseDisk(fh)
 
-                if sparse_disk.descriptor and sparse_disk.descriptor.attr["parentCID"] != "ffffffff":
-                    sparse_disk.parent = open_parent(path.parent, sparse_disk.descriptor.attr["parentFileNameHint"])
-                self.disks.append(sparse_disk)
+                    if sparse_disk.descriptor and sparse_disk.descriptor.attr["parentCID"] != "ffffffff":
+                        sparse_disk.parent = open_parent(
+                            path.parent,
+                            sparse_disk.descriptor.attr["parentFileNameHint"],
+                            parent_cid=sparse_disk.descriptor.attr["parentCID"],
+                            child_cid=sparse_disk.descriptor.attr.get("CID"),
+                            candidates=parent_candidates,
+                            _chain=_chain,
+                        )
+                    self.disks.append(sparse_disk)
 
-            else:
-                self.disks.append(RawDisk(fh))
+                else:
+                    self.disks.append(RawDisk(fh))
+        except Exception:
+            # Release every handle we opened (and any already resolved parents) before propagating
+            for disk in self.disks:
+                parent = getattr(disk, "parent", None)
+                if parent is not None and hasattr(parent, "close"):
+                    parent.close()
+            for opened_fh in self._opened_fhs:
+                opened_fh.close()
+            if self.parent is not None:
+                self.parent.close()
+            raise
 
         size = 0
         for disk in self.disks:
@@ -87,6 +134,18 @@ class VMDK(AlignedStream):
             self.sector_count += disk.sector_count
 
         super().__init__(size)
+
+    def close(self) -> None:
+        for disk in self.disks:
+            disk.fh.close()
+            parent = getattr(disk, "parent", None)
+            if parent is not None and hasattr(parent, "close"):
+                parent.close()
+        for opened_fh in self._opened_fhs:
+            opened_fh.close()
+        if self.parent is not None:
+            self.parent.close()
+        super().close()
 
     def read_sectors(self, sector: int, count: int) -> bytes:
         log.debug("VMDK::read_sectors(0x%x, 0x%x)", sector, count)
@@ -526,18 +585,143 @@ class DiskDescriptor:
         return str_template.format(descriptor_settings, extents, disk_db)
 
 
-def open_parent(path: Path, filename_hint: str) -> VMDK:
-    try:
-        filename_hint = filename_hint.replace("\\", "/")
-        hint_path, _, filename = filename_hint.rpartition("/")
-        filepath = path.joinpath(filename)
+def _vmdk_cid(vmdk: VMDK) -> str | None:
+    """Return the CID from the descriptor of an opened ``vmdk``, if any."""
+    descriptor = vmdk.descriptor
+    if descriptor is None:
+        for disk in vmdk.disks:
+            descriptor = getattr(disk, "descriptor", None)
+            if descriptor is not None:
+                break
+    return descriptor.attr.get("CID") if descriptor else None
+
+
+def _read_candidate_cid(path: Path) -> str | None:
+    """Cheaply probe the CID of a candidate evidence file without resolving its parent chain."""
+    with path.open("rb") as fh:
+        magic = fh.read(4)
+        fh.seek(-4, io.SEEK_CUR)
+
+        if magic == b"# Di":
+            descriptor = DiskDescriptor.parse(fh.read().decode())
+        elif magic in (COWD_MAGIC, VMDK_MAGIC, SESPARSE_MAGIC):
+            descriptor = SparseDisk(fh).descriptor
+        else:
+            return None
+
+    return descriptor.attr.get("CID") if descriptor else None
+
+
+def _resolve_hint_path(path: Path, filename_hint: str) -> Path:
+    filename_hint = filename_hint.replace("\\", "/")
+    hint_path, _, filename = filename_hint.rpartition("/")
+    filepath = path.joinpath(filename)
+    if not filepath.exists():
+        filepath = path.joinpath(filename_hint)
         if not filepath.exists():
-            filepath = path.joinpath(filename_hint)
-            if not filepath.exists():
-                _, _, hint_path_name = hint_path.rpartition("/")
-                filepath = path.parent.joinpath(hint_path_name).joinpath(filename)
-        vmdk = VMDK(filepath)
+            _, _, hint_path_name = hint_path.rpartition("/")
+            filepath = path.parent.joinpath(hint_path_name).joinpath(filename)
+    return filepath
+
+
+def _open_parent_from_candidates(
+    candidates: Iterable[Path | str],
+    expected_cid: str | None,
+    chain: tuple[str, ...],
+    filename_hint: str,
+    child_cid: str | None,
+) -> VMDK:
+    """Resolve a parent disk from caller-supplied candidate evidence files, matched by CID."""
+    candidates = [Path(candidate) for candidate in candidates]
+    matches = []
+
+    for candidate in candidates:
+        try:
+            candidate_cid = _read_candidate_cid(candidate)
+        except Exception as err:
+            log.debug("Skipping unreadable parent candidate %s: %s", candidate, err)
+            continue
+
+        if candidate_cid is None:
+            continue
+        if expected_cid and expected_cid != "ffffffff" and candidate_cid.lower() != expected_cid:
+            continue
+        matches.append(candidate)
+
+    if not matches:
+        raise ParentChainError(
+            f"No trustworthy parent for child CID {child_cid}: none of the {len(candidates)} "
+            f"candidate(s) has CID {expected_cid} (parent hint {filename_hint!r})"
+        )
+
+    if len(matches) > 1:
+        raise ParentChainError(
+            f"Ambiguous parent for child CID {child_cid}: candidates "
+            f"{[str(match) for match in matches]} all match CID {expected_cid}"
+        )
+
+    candidate = matches[0]
+    try:
+        return VMDK(candidate, parent_candidates=candidates, _chain=chain)
+    except ParentChainError:
+        raise
     except Exception as err:
-        raise IOError(f"Failed to open parent disk with hint {filename_hint} from path {path}: {err}")
+        raise ParentChainError(
+            f"Failed to open parent candidate {candidate} for child CID {child_cid}: {err}"
+        ) from err
+
+
+def open_parent(
+    path: Path,
+    filename_hint: str,
+    parent_cid: str | None = None,
+    child_cid: str | None = None,
+    candidates: Iterable[Path | str] | None = None,
+    _chain: tuple[str, ...] = (),
+) -> VMDK:
+    """Resolve and open the parent of a VMDK delta disk.
+
+    A parent is only accepted if its CID matches the ``parent_cid`` recorded by the child,
+    so a renamed chain member or a same-named but different disk can never be silently
+    stitched into the chain. When ``candidates`` is given, the parent is resolved by CID
+    from those caller-supplied evidence files only; otherwise the file name hint is used
+    as a lookup hint and the result is still verified by CID.
+
+    Raises:
+        ParentChainError: If the chain is cyclic, the parent identity does not match,
+            multiple candidates qualify, or no trustworthy parent can be found. The error
+            message names the parent-child relationship that could not be trusted.
+    """
+    chain = _chain
+    if child_cid:
+        chain = chain + (child_cid.lower(),)
+
+    expected_cid = parent_cid.lower() if parent_cid else None
+
+    if expected_cid and expected_cid != "ffffffff" and expected_cid in chain:
+        raise ParentChainError(
+            f"Cyclic VMDK parent chain at child CID {child_cid}: parent CID {expected_cid} "
+            f"(parent hint {filename_hint!r}) already appears in the chain"
+        )
+
+    if candidates is not None:
+        return _open_parent_from_candidates(candidates, expected_cid, chain, filename_hint, child_cid)
+
+    try:
+        filepath = _resolve_hint_path(path, filename_hint)
+        vmdk = VMDK(filepath, _chain=chain)
+    except ParentChainError:
+        raise
+    except Exception as err:
+        raise ParentChainError(f"Failed to open parent disk with hint {filename_hint} from path {path}: {err}")
+
+    if expected_cid and expected_cid != "ffffffff":
+        actual_cid = _vmdk_cid(vmdk)
+        if actual_cid is None or actual_cid.lower() != expected_cid:
+            vmdk.close()
+            raise ParentChainError(
+                f"Parent identity mismatch at child CID {child_cid}: parent {filepath} "
+                f"(parent hint {filename_hint!r}) has CID {actual_cid}, expected {expected_cid}"
+            )
 
     return vmdk
