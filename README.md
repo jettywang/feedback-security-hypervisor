@@ -19,6 +19,12 @@ pip install dissect.hypervisor
 
 This module is also automatically installed if you install the `dissect` package.
 
+## Legacy VHD diagnostics
+
+Legacy differencing VHDs require parent-chain resolution and cannot be safely flattened as dynamic disks. The
+`vhd-diagnose` tool inspects footer disk type, parent locators, BAT entries and sector bitmaps without reading the
+image as a flat disk. See [the VHD forensic support matrix](docs/vhd-forensics.md) for the trust rules.
+
 ## Build and test instructions
 
 This project uses `tox` to build source and wheel distributions. Run the following command from the root folder to build
