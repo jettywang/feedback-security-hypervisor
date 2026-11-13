@@ -45,6 +45,7 @@ PASS2KEY_MAP = {
 class VMX:
     def __init__(self, attr: dict[str, str]):
         self.attr = attr
+        self._unlocked = False
 
     @classmethod
     def parse(cls, string: str) -> VMX:
@@ -82,23 +83,64 @@ class VMX:
         """
         return "encryption.keysafe" in self.attr
 
+    @property
+    def unlocked(self) -> bool:
+        """Return whether this VMX has been successfully unlocked."""
+        return self._unlocked
+
     def unlock_with_phrase(self, passphrase: str) -> None:
         """Unlock this VMX in-place with a passphrase if it's encrypted.
 
         This will load the ``KeySafe`` from the current dictionary and attempt to recover the encryption key
         from it using the given passphrase. This key is used to decrypt the encrypted VMX data.
 
-        The dictionary is updated in-place with the encrypted VMX data.
+        All key locators are tried until one of them decrypts and authenticates the complete configuration.
+        Only then is the dictionary updated in-place, so failed attempts leave the VMX unchanged and can be
+        retried with another passphrase. Error messages never contain the passphrase or decrypted contents.
         """
         if not self.encrypted:
             raise TypeError("VMX is not encrypted")
 
-        safe = KeySafe.from_text(self.attr["encryption.keysafe"])
-        key, mac = safe.unseal_with_phrase(passphrase)
+        try:
+            keysafe = self.attr["encryption.keysafe"]
+            encryption_data = self.attr["encryption.data"]
+        except KeyError:
+            raise ValueError("Unable to unlock VMX") from None
 
-        encrypted = base64.b64decode(self.attr["encryption.data"])
-        decrypted = _decrypt_hmac(key, encrypted, mac)
-        self.attr.update(**_parse_dictionary(decrypted.decode()))
+        try:
+            safe = KeySafe.from_text(keysafe)
+        except (IndexError, KeyError, NotImplementedError, TypeError, ValueError):
+            raise ValueError("Unable to unlock VMX") from None
+
+        try:
+            encrypted = base64.b64decode(encryption_data)
+        except (TypeError, ValueError):
+            raise ValueError("Unable to unlock VMX") from None
+
+        for locator in safe.locators:
+            if not isinstance(locator, Pair) or not locator.has_phrase():
+                continue
+
+            try:
+                unlocked_key = locator.unlock_with_phrase(passphrase)
+                crypto_dict = _parse_crypto_dict(unlocked_key.decode())
+                key = base64.b64decode(crypto_dict["key"])
+                decrypted = _decrypt_hmac(key, encrypted, locator.mac)
+                config = _parse_config(decrypted.decode())
+            except (IndexError, KeyError, TypeError, UnicodeDecodeError, ValueError):
+                # A candidate can fail at any layer: KDF, wrapped-key MAC, key
+                # material parsing, final ciphertext MAC or configuration
+                # parsing. Keep the failure contained and try the next one.
+                continue
+
+            # Nothing above touches the public state. Publish the complete
+            # configuration and the unlocked state together, only after the
+            # final ciphertext has been authenticated and fully parsed.
+            self.attr.update(config)
+            self._unlocked = True
+            return
+
+        raise ValueError("Unable to unlock VMX")
 
     def disks(self) -> list[str]:
         """Return a list of paths to disk files."""
@@ -137,6 +179,29 @@ class VMX:
         return sorted(disk_files)
 
 
+def _parse_config(string: str) -> dict[str, str]:
+    """Parse a decrypted VMX configuration dictionary.
+
+    Unlock only accepts a complete configuration. A fragment that is missing
+    the key/value structure is treated as a failed candidate rather than as a
+    partial configuration.
+    """
+    attr = _parse_dictionary(string)
+    if not attr:
+        raise ValueError("Invalid VMX configuration")
+
+    for line in string.split("\n"):
+        line = line.strip()
+
+        if not line or line.startswith("#"):
+            continue
+
+        if "=" not in line:
+            raise ValueError("Invalid VMX configuration")
+
+    return attr
+
+
 def _parse_dictionary(string: str) -> dict[str, str]:
     """Parse a VMX dictionary."""
     dictionary = {}
@@ -162,7 +227,7 @@ class KeySafe:
     def unseal_with_phrase(self, passphrase: str) -> bytes:
         """Unseal this ``KeySafe`` with a passphrase and return the decrypted key."""
         for locator in self.locators:
-            if not locator.has_phrase():
+            if not isinstance(locator, Pair) or not locator.has_phrase():
                 continue
 
             try:
@@ -171,7 +236,7 @@ class KeySafe:
                 # type=key:cipher=AES-256:key=base64value'
                 crypto_dict = _parse_crypto_dict(data.decode())
                 return base64.b64decode(crypto_dict["key"]), locator.mac
-            except ValueError:
+            except (IndexError, KeyError, TypeError, UnicodeDecodeError, ValueError):
                 pass
 
         raise ValueError("No compatible locator")
@@ -186,7 +251,7 @@ class KeySafe:
 
         # First part must be a list of pairs
         locators = _parse_key_locator(remainder)
-        if not isinstance(locators, list) and not all(isinstance(member, Pair) for member in locators):
+        if not isinstance(locators, list) or not all(isinstance(member, Pair) for member in locators):
             raise ValueError("Invalid KeySafe string, not a list of pairs")
 
         return KeySafe(locators)
