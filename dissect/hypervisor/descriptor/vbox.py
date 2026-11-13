@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from functools import cached_property
 from typing import TYPE_CHECKING, TextIO
@@ -9,6 +10,8 @@ from defusedxml import ElementTree
 
 if TYPE_CHECKING:
     from xml.etree.ElementTree import Element
+
+    from dissect.hypervisor.descriptor.vbox_diff import DiskChange
 
 NS = "{http://www.virtualbox.org/}"
 
@@ -61,6 +64,26 @@ class VBox:
         """All snapshots."""
         return self.machine.snapshots
 
+    def diff_snapshots(self, left: UUID | Snapshot, right: UUID | Snapshot) -> list[DiskChange]:
+        """Diff the hard disk attachments between two snapshots.
+
+        See :func:`dissect.hypervisor.descriptor.vbox_diff.diff_disk_attachments` for the change
+        classification and the returned :class:`~dissect.hypervisor.descriptor.vbox_diff.DiskChange`
+        objects.
+
+        Args:
+            left: The left snapshot or its UUID.
+            right: The right snapshot or its UUID.
+
+        Returns:
+            The ordered list of classified disk differences.
+        """
+        from dissect.hypervisor.descriptor.vbox_diff import diff_disk_attachments
+
+        left_snapshot = left if isinstance(left, Snapshot) else self.snapshots[left]
+        right_snapshot = right if isinstance(right, Snapshot) else self.snapshots[right]
+        return diff_disk_attachments(left_snapshot, right_snapshot)
+
 
 class Machine:
     def __init__(self, vbox: VBox, element: Element):
@@ -96,7 +119,12 @@ class Machine:
         while stack:
             parent, element = stack.pop()
             hdd = HardDisk(self, element, parent)
-            result[hdd.uuid] = hdd
+
+            # A medium can appear in more than one branch of a forked snapshot tree. Keep the first
+            # occurrence, which is the one traversed with its actual parent; later traversals reach
+            # the same node through another branch and would otherwise overwrite it parentless.
+            if hdd.uuid not in result:
+                result[hdd.uuid] = hdd
 
             stack.extend([(hdd, child) for child in element.findall(f"./{NS}HardDisk")])
 
@@ -178,6 +206,25 @@ class HardDisk:
 
         return False
 
+    @cached_property
+    def ancestors(self) -> tuple[HardDisk, ...]:
+        """The parent media of this disk, ordered from the base image up to the direct parent."""
+        result = []
+        disk = self.parent
+        while disk is not None:
+            result.append(disk)
+            disk = disk.parent
+        return tuple(reversed(result))
+
+    @cached_property
+    def chain(self) -> tuple[HardDisk, ...]:
+        """The full media chain, ordered from the base image down to (and including) this disk."""
+        return (*self.ancestors, self)
+
+    def is_ancestor_of(self, other: HardDisk) -> bool:
+        """Whether this disk is an ancestor of ``other`` in the media registry."""
+        return self.uuid in {disk.uuid for disk in other.ancestors}
+
 
 class Snapshot:
     def __init__(self, vbox: VBox, element: Element, parent: Snapshot | Machine | None = None):
@@ -217,10 +264,79 @@ class Hardware:
     def __repr__(self) -> str:
         return f"<Hardware disks={len(self.disks)}>"
 
+    @cached_property
+    def attachments(self) -> list[Attachment]:
+        """All hard disk attachments, including those referencing media missing from the registry."""
+        result = []
+
+        controllers = self.element.findall(f"./{NS}StorageControllers/{NS}StorageController")
+        for controller in controllers:
+            controller_name = controller.get("name")
+            for device in controller.findall(f"./{NS}AttachedDevice[@type='HardDisk']"):
+                image = device.find(f"./{NS}Image")
+                image_uuid = UUID(image.get("uuid").strip("{}")) if image is not None else None
+                result.append(
+                    Attachment(
+                        hardware=self,
+                        element=device,
+                        controller=controller_name,
+                        port=int(device.get("port")),
+                        device=int(device.get("device")),
+                        image_uuid=image_uuid,
+                        image_element=image,
+                    )
+                )
+
+        return result
+
     @property
     def disks(self) -> list[HardDisk]:
-        """All attached hard disks."""
-        images = self.element.findall(
-            f"./{NS}StorageControllers/{NS}StorageController/{NS}AttachedDevice[@type='HardDisk']/{NS}Image"
-        )
-        return [self.vbox.media[UUID(image.get("uuid").strip("{}"))] for image in images]
+        """All attached hard disks that are present in the media registry.
+
+        Attachments referencing a medium that is absent from the :class:`VBox` media registry are
+        skipped; use :attr:`attachments` to inspect every controller slot, including unresolved ones.
+        """
+        return [attachment.medium for attachment in self.attachments if attachment.medium is not None]
+
+
+@dataclass(frozen=True)
+class Attachment:
+    """A hard disk attached to a storage controller slot.
+
+    The attachment only records the referenced medium UUID. A UUID that cannot be resolved through
+    the media registry keeps the relationship unknown instead of guessing a medium by file path.
+
+    Args:
+        hardware: The hardware state the attachment belongs to.
+        element: The ``AttachedDevice`` XML node.
+        controller: The storage controller name.
+        port: The controller port the device is attached to.
+        device: The device number on the controller port.
+        image_uuid: The referenced medium UUID, or ``None`` when the slot has no image.
+        image_element: The ``Image`` XML node, or ``None`` when the slot has no image.
+    """
+
+    hardware: Hardware
+    element: Element
+    controller: str | None
+    port: int
+    device: int
+    image_uuid: UUID | None
+    image_element: Element | None
+
+    @property
+    def slot(self) -> tuple[str | None, int, int]:
+        """The unique controller slot identifier ``(controller, port, device)``."""
+        return (self.controller, self.port, self.device)
+
+    @property
+    def slot_name(self) -> str:
+        """A human-readable representation of the controller slot."""
+        return f"{self.controller} port {self.port} device {self.device}"
+
+    @property
+    def medium(self) -> HardDisk | None:
+        """The referenced medium, or ``None`` when the UUID is absent from the media registry."""
+        if self.image_uuid is None:
+            return None
+        return self.hardware.vbox.media.get(self.image_uuid)
