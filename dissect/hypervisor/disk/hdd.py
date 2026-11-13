@@ -39,45 +39,61 @@ class HDD:
 
         self.descriptor = Descriptor(descriptor_path)
 
+    def _candidate_image_paths(self, path: Path) -> Iterator[Path]:
+        """Yield candidate paths for an image file, in order of preference.
+
+        Args:
+            path: The image path as referenced by the descriptor.
+        """
+        root = self.path
+        filename = path.name
+
+        if path.is_absolute():
+            yield path
+
+            # If the absolute path does not exist, we're probably dealing with a HDD
+            # that's been copied or moved (e.g., uploaded or copied as evidence)
+            # Try a couple of common patterns to see if we can locate the file
+            #
+            # Example variables:
+            # root = /some/path/example.pvm/example.hdd/
+            # path = /other/path/absolute.pvm/absolute.hdd/absolute.ext
+
+            # File is in same HDD directory
+            # candidate_path = /some/path/example.pvm/example.hdd/absolute.ext
+            yield root / filename
+            # File is in a separate HDD directory in parent (VM) directory
+            # candidate_path = /some/path/example.pvm/absolute.hdd/absolute.ext
+            yield root.parent / path.parent.name / filename
+            # File is in .pvm directory in parent of parent directory (linked clones)
+            # candidate_path = /some/path/absolute.pvm/absolute.hdd/absolute.ext
+            yield root.parent.parent / path.parent.parent.name / path.parent.name / filename
+        else:
+            # If the path is relative, it's always relative to the HDD root
+            yield root / path
+
+    def _resolve_image_path(self, path: Path) -> Path | None:
+        """Resolve an image path to an existing file, without opening it.
+
+        Args:
+            path: The image path as referenced by the descriptor.
+        """
+        for candidate in self._candidate_image_paths(path):
+            if candidate.exists():
+                return candidate
+        return None
+
     def _open_image(self, path: Path) -> BinaryIO:
         """Helper method for opening image files relative to this HDD.
 
         Args:
             path: The path to the image file to open.
         """
-        root = self.path
-        filename = path.name
-
-        if path.is_absolute():
-            # If the path is absolute, check if it exists
-            if not path.exists():
-                # If the absolute path does not exist, we're probably dealing with a HDD
-                # that's been copied or moved (e.g., uploaded or copied as evidence)
-                # Try a couple of common patterns to see if we can locate the file
-                #
-                # Example variables:
-                # root = /some/path/example.pvm/example.hdd/
-                # path = /other/path/absolute.pvm/absolute.hdd/absolute.ext
-
-                # File is in same HDD directory
-                # candidate_path = /some/path/example.pvm/example.hdd/absolute.ext
-                candidate_path = root / filename
-                if not candidate_path.exists():
-                    # File is in a separate HDD directory in parent (VM) directory
-                    # candidate_path = /some/path/example.pvm/absolute.hdd/absolute.ext
-                    candidate_path = root.parent / path.parent.name / filename
-
-                if not candidate_path.exists():
-                    # File is in .pvm directory in parent of parent directory (linked clones)
-                    # candidate_path = /some/path/absolute.pvm/absolute.hdd/absolute.ext
-                    candidate_path = root.parent.parent / path.parent.parent.name / path.parent.name / filename
-
-                path = candidate_path
-
-            return path.open("rb")
-
-        # If the path is relative, it's always relative to the HDD root
-        return (root / path).open("rb")
+        resolved_path = self._resolve_image_path(path)
+        if resolved_path is None:
+            # No candidate exists, open the original path to raise a useful error
+            resolved_path = path if path.is_absolute() else self.path / path
+        return resolved_path.open("rb")
 
     def open(self, guid: str | UUID | None = None) -> BinaryIO:
         """Open a stream for this HDD, optionally for a specific snapshot.
@@ -112,6 +128,141 @@ class HDD:
             streams.append((storage, stream))
 
         return StorageStream(streams)
+
+    def verify(self, guid: str | UUID | None = None) -> IntegrityReport:
+        """Verify the integrity of this HDD before opening it, without reading image data.
+
+        Checks the ancestor chain of the target snapshot GUID, the image coverage of every
+        storage and the logical sector ranges of the storages. Only the descriptor and file
+        existence are inspected; no image content is read and nothing is modified.
+
+        Args:
+            guid: The snapshot GUID to verify. Defaults to the "top" snapshot.
+
+        Returns:
+            An :class:`IntegrityReport` with the resolved chain and a list of found issues.
+        """
+        if guid and not isinstance(guid, UUID):
+            guid = UUID(guid)
+
+        if guid is None:
+            guid = self.descriptor.snapshots.top_guid or DEFAULT_TOP_GUID
+
+        issues: list[IntegrityIssue] = []
+
+        # Check for duplicate snapshot GUIDs in the descriptor
+        shots_by_guid: dict[UUID, Shot] = {}
+        for shot in self.descriptor.snapshots.shots:
+            if shot.guid in shots_by_guid:
+                issues.append(
+                    IntegrityIssue(
+                        "duplicate-guid",
+                        f"Duplicate snapshot GUID in descriptor: {shot.guid}",
+                        guid=shot.guid,
+                    )
+                )
+            else:
+                shots_by_guid[shot.guid] = shot
+
+        # Walk the ancestor chain of the target GUID, detecting cycles and missing parents
+        chain: list[UUID] = []
+        if guid not in shots_by_guid:
+            issues.append(
+                IntegrityIssue(
+                    "unknown-snapshot",
+                    f"Snapshot GUID not found in descriptor: {guid}",
+                    guid=guid,
+                )
+            )
+        else:
+            current = guid
+            while True:
+                if current in chain:
+                    issues.append(
+                        IntegrityIssue(
+                            "parent-cycle",
+                            f"Cycle in snapshot parent chain at GUID: {current}",
+                            guid=current,
+                        )
+                    )
+                    break
+                chain.append(current)
+
+                parent = shots_by_guid[current].parent
+                if parent == NULL_GUID:
+                    break
+                if parent not in shots_by_guid:
+                    issues.append(
+                        IntegrityIssue(
+                            "missing-parent",
+                            f"Snapshot {current} references missing parent snapshot: {parent}",
+                            guid=parent,
+                        )
+                    )
+                    break
+                current = parent
+
+        # Check that every storage has an image for every snapshot in the chain
+        # and that every referenced image file is present on disk
+        for storage in self.descriptor.storage_data.storages:
+            image_guids = {image.guid for image in storage.images}
+            for chain_guid in chain:
+                if chain_guid not in image_guids:
+                    issues.append(
+                        IntegrityIssue(
+                            "missing-image",
+                            f"Storage {storage.start}-{storage.end} has no image for snapshot {chain_guid}",
+                            guid=chain_guid,
+                            storage=storage,
+                        )
+                    )
+
+            for image in storage.images:
+                if self._resolve_image_path(Path(image.file)) is None:
+                    issues.append(
+                        IntegrityIssue(
+                            "missing-file",
+                            f"Image file not found on disk: {image.file}",
+                            guid=image.guid,
+                            storage=storage,
+                            file=image.file,
+                        )
+                    )
+
+        # Check the logical sector ranges of the storages for gaps and overlaps
+        covered = 0
+        sorted_storages = sorted(
+            self.descriptor.storage_data.storages, key=lambda storage: (storage.start, storage.end)
+        )
+        for storage in sorted_storages:
+            if storage.end <= storage.start:
+                issues.append(
+                    IntegrityIssue(
+                        "invalid-range",
+                        f"Storage has an invalid sector range: {storage.start}-{storage.end}",
+                        storage=storage,
+                    )
+                )
+                continue
+            if storage.start < covered:
+                issues.append(
+                    IntegrityIssue(
+                        "storage-overlap",
+                        f"Storage {storage.start}-{storage.end} overlaps with already covered range up to {covered}",
+                        storage=storage,
+                    )
+                )
+            elif storage.start > covered:
+                issues.append(
+                    IntegrityIssue(
+                        "storage-gap",
+                        f"Gap in storage coverage between sectors {covered} and {storage.start}",
+                        storage=storage,
+                    )
+                )
+            covered = max(covered, storage.end)
+
+        return IntegrityReport(guid, chain, issues)
 
 
 class Descriptor:
@@ -222,7 +373,7 @@ class Snapshots(XMLEntry):
     @classmethod
     def _from_xml(cls, element: Element) -> Snapshots:
         top_guid = element.find("TopGUID")
-        if top_guid:
+        if top_guid is not None:
             top_guid = UUID(top_guid.text)
         shots = list(map(Shot.from_xml, element.iterfind("Shot")))
 
@@ -255,6 +406,55 @@ class Shot(XMLEntry):
             UUID(element.find("GUID").text),
             UUID(element.find("ParentGUID").text),
         )
+
+
+@dataclass
+class IntegrityIssue:
+    """A single integrity issue found by :meth:`HDD.verify`.
+
+    Args:
+        category: The category of the issue, e.g. ``parent-cycle``, ``duplicate-guid``,
+            ``missing-parent``, ``unknown-snapshot``, ``missing-image``, ``missing-file``,
+            ``invalid-range``, ``storage-gap`` or ``storage-overlap``.
+        message: A human readable description of the issue.
+        guid: The snapshot or image GUID related to the issue, if any.
+        storage: The :class:`Storage` related to the issue, if any.
+        file: The image file related to the issue, if any.
+    """
+
+    category: str
+    message: str
+    guid: UUID | None = None
+    storage: Storage | None = None
+    file: str | None = None
+
+
+@dataclass
+class IntegrityReport:
+    """Result of :meth:`HDD.verify`.
+
+    Args:
+        guid: The snapshot GUID that was verified.
+        chain: The resolved ancestor chain of the target GUID, target first.
+        issues: The list of integrity issues that were found.
+    """
+
+    guid: UUID
+    chain: list[UUID]
+    issues: list[IntegrityIssue]
+
+    @property
+    def ok(self) -> bool:
+        """Return whether no integrity issues were found."""
+        return not self.issues
+
+    def by_category(self, category: str) -> list[IntegrityIssue]:
+        """Return all issues of a specific category.
+
+        Args:
+            category: The issue category to filter on.
+        """
+        return [issue for issue in self.issues if issue.category == category]
 
 
 class StorageStream(AlignedStream):
