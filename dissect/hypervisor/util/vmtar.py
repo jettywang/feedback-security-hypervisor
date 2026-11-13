@@ -85,23 +85,34 @@ class VisorTarFile(tarfile.TarFile):
 
         compressed = False
 
+        # Keep a stable reference to the raw, seekable stream. Every decompression
+        # attempt must wrap this object instead of a wrapper from a failed attempt,
+        # because a GzipFile/LZMAFile may already have consumed bytes from it.
+        raw_fileobj = fileobj
+
         try:
-            t = cls.taropen(name, mode, fileobj, **kwargs)
+            t = cls.taropen(name, mode, raw_fileobj, **kwargs)
         except Exception:
-            if fileobj is not None:
-                fileobj.seek(0)
+            if raw_fileobj is not None:
+                raw_fileobj.seek(0)
             try:
-                fileobj = GzipFile(name, mode + "b", fileobj=fileobj)
+                gz_fileobj = GzipFile(name, mode + "b", fileobj=raw_fileobj)
             except OSError as e:
-                if fileobj is not None and mode == "r":
+                if raw_fileobj is not None and mode == "r":
                     raise tarfile.ReadError("not a visor file") from e
                 raise
 
             try:
+                # GzipFile does not validate the stream until it is read, so probe one
+                # byte here. Without this, LZMA data is mistaken for gzip and the LZMA
+                # fallback below is never reached.
+                gz_fileobj.peek(1)
+                fileobj = gz_fileobj
                 t = cls.taropen(name, mode, fileobj, **kwargs)
             except Exception:
-                fileobj.seek(0)
-                fileobj = LZMAFile(fileobj or name, mode)  # noqa: SIM115
+                if raw_fileobj is not None:
+                    raw_fileobj.seek(0)
+                fileobj = LZMAFile(raw_fileobj or name, mode)  # noqa: SIM115
 
                 try:
                     t = cls.taropen(name, mode, fileobj, **kwargs)
