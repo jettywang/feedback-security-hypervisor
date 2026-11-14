@@ -15,3 +15,7 @@ class InvalidSignature(Error):
 
 class InvalidVirtualDisk(Error):
     pass
+
+
+class MissingParentDisk(Error):
+    pass

@@ -26,7 +26,7 @@ from dissect.hypervisor.disk.c_vhdx import (
     VIRTUAL_DISK_SIZE_GUID,
     c_vhdx,
 )
-from dissect.hypervisor.exceptions import InvalidSignature, InvalidVirtualDisk
+from dissect.hypervisor.exceptions import InvalidSignature, InvalidVirtualDisk, MissingParentDisk
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -108,9 +108,12 @@ class VHDX(AlignedStream):
         sectors_read = []
 
         while count > 0:
-            read_count = min(count, self._sectors_per_block)
-            read_size = read_count * self.sector_size
             block, sector_in_block = divmod(sector, self._sectors_per_block)
+            # Never read past the end of the current block. A request that starts in the
+            # middle of a block must be split on the block boundary so that each iteration
+            # only interprets the bitmap and payload of a single block.
+            read_count = min(count, self._sectors_per_block - sector_in_block)
+            read_size = read_count * self.sector_size
             bat_entry = self.bat.pb(block)
 
             if bat_entry.state == c_vhdx.PAYLOAD_BLOCK_NOT_PRESENT:
@@ -145,22 +148,33 @@ class VHDX(AlignedStream):
                 sector_in_chunk = (block_in_chunk * self._sectors_per_block) + sector_in_block
 
                 byte_idx, bit_idx = divmod(sector_in_chunk, 8)
+                # Read enough bitmap bytes to cover every requested sector, accounting for the
+                # fact that the first sector may not start on bit 0 of its bitmap byte.
+                bitmap_size = (bit_idx + read_count + 7) // 8
                 # Seek into the bitmap to where we are relative in the cluster
                 self.fh.seek((sector_bitmap_entry.file_offset_mb * MB) + byte_idx)
                 # Read the bitmap for the amount of sectors we're interested in, rounded up
-                sector_bitmap = self.fh.read((read_count + 8 - 1) // 8)
+                sector_bitmap = self.fh.read(bitmap_size)
 
                 # Calculate runs from the bitmap and read from the correct source
                 relative_sector = 0
                 for run_type, run_count in _iter_partial_runs(sector_bitmap, bit_idx, read_count):
                     if run_type == 0:
-                        # Read from parent
+                        # Read from parent. A partially present block references sectors that
+                        # only exist in the parent disk, so a missing parent is a hard failure:
+                        # silently returning zeroes or adjacent child data would corrupt the read.
+                        if not self.parent:
+                            raise MissingParentDisk(
+                                f"Block {block} is partially present but no parent disk is "
+                                f"available to read sector {sector + relative_sector} from"
+                            )
                         sectors_read.append(self.parent.read_sectors(sector + relative_sector, run_count))
                     else:
                         # Read from this file
                         # Here we are calculating relative to the block again
                         self.fh.seek(
-                            (bat_entry.file_offset_mb * MB) + ((sector_in_block + relative_sector) * self.sector_size)
+                            (bat_entry.file_offset_mb * MB)
+                            + ((sector_in_block + relative_sector) * self.sector_size)
                         )
                         sectors_read.append(self.fh.read(run_count * self.sector_size))
 
@@ -291,30 +305,35 @@ class MetadataTable:
 
 
 def _iter_partial_runs(bitmap: bytes, start_idx: int, length: int) -> Iterator[tuple[int, int]]:
-    current_type = (bitmap[0] & (1 << start_idx)) >> start_idx
+    """Iterate over the runs of set and unset bits in a sector bitmap.
+
+    The bitmap is interpreted least-significant-bit first, matching the VHDX on-disk
+    layout. ``start_idx`` is the bit offset (0-7) of the first sector within the first
+    bitmap byte, which does not have to be 0. Yields ``(run_type, run_count)`` tuples
+    where ``run_type`` is 1 for a set bit (sector present in this file) and 0 for an
+    unset bit (sector must be read from the parent).
+    """
+    if length <= 0:
+        return
+
+    bit_index = start_idx
+    current_type = (bitmap[0] >> start_idx) & 1
     current_count = 0
 
-    for byte in bitmap:
-        if (current_type, byte) == (0, 0) or (current_type, byte) == (1, 0xFF):
-            max_count = min(length, 8 - start_idx)
-            current_count += max_count
-            length -= max_count
-            start_idx = 0
+    for _ in range(length):
+        byte = bitmap[bit_index // 8]
+        sector_type = (byte >> (bit_index % 8)) & 1
+
+        if sector_type == current_type:
+            current_count += 1
         else:
-            for bit_idx in range(start_idx, min(length, 8)):
-                sector_type = (byte & (1 << bit_idx)) >> bit_idx
+            yield (current_type, current_count)
+            current_type = sector_type
+            current_count = 1
 
-                if sector_type == current_type:
-                    current_count += 1
-                else:
-                    yield (current_type, current_count)
-                    current_type = sector_type
-                    current_count = 1
+        bit_index += 1
 
-                length -= 1
-
-    if current_count:
-        yield (current_type, current_count)
+    yield (current_type, current_count)
 
 
 def open_parent(path: Path, locator: dict[str, str]) -> VHDX:
