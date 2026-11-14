@@ -5,11 +5,11 @@ from __future__ import annotations
 
 import sys
 import zlib
+from dataclasses import dataclass
+from enum import Enum
 from functools import cached_property, lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO
-
-from dissect.util.stream import AlignedStream
 
 from dissect.hypervisor.disk.c_qcow2 import (
     NORMAL_SUBCLUSTER_TYPES,
@@ -23,6 +23,7 @@ from dissect.hypervisor.disk.c_qcow2 import (
     ctz,
 )
 from dissect.hypervisor.exceptions import Error, InvalidHeaderError
+from dissect.util.stream import AlignedStream
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -35,6 +36,84 @@ try:
     HAS_ZSTD = True
 except ImportError:
     HAS_ZSTD = False
+
+
+class QCow2MapSource(Enum):
+    """Where the bytes of a logical range are actually produced from."""
+
+    #: The bytes are stored, uncompressed, in the image itself or in its external data file.
+    DATA = "data"
+    #: The bytes are stored in a compressed cluster and must be decompressed before use.
+    COMPRESSED = "compressed"
+    #: The bytes are explicitly defined as all zero by a zero L2 entry or subcluster.
+    ZERO = "zero"
+    #: The image itself contains no data; the bytes must be read from a backing file.
+    BACKING = "backing"
+    #: No image in the chain defines the bytes; they read back as zero only because no backing file is present.
+    UNALLOCATED_ZERO = "unallocated-zero"
+    #: The bytes would come from a backing layer that is not available, so their content cannot be proven.
+    UNKNOWN = "unknown"
+
+
+@dataclass(slots=True)
+class QCow2Mapping:
+    """Provenance of a contiguous logical range, produced from the same mapping logic as :class:`QCow2Stream` reads.
+
+    A mapping describes how a single contiguous run of guest offsets is resolved. Ranges backed by the same file
+    appear as a single run, even when they span multiple clusters or subclusters. Ranges that need a backing file
+    are resolved into the runs returned by that backing layer itself.
+
+    Args:
+        guest_offset: First guest offset covered by this mapping.
+        guest_length: Number of guest bytes covered by this mapping.
+        source: How the bytes of the range are produced.
+        layer: Position of the image that defines the range in the backing chain, where ``0`` is the top image.
+        evidence: Open file holding the evidence bytes, or ``None`` for zero ranges and unproven ranges.
+        evidence_name: Name of the evidence file, or ``None`` when there is no evidence file.
+        evidence_offset: Offset of the evidence bytes in ``evidence``, or ``None`` when there is no evidence file.
+        evidence_length: Number of bytes occupied by the evidence in ``evidence``, or ``None`` without an evidence file.
+        granularity: Smallest unit, in guest bytes, that the mapping can distinguish. Compressed clusters are mapped
+            as a whole cluster, while extended L2 images can distinguish individual subclusters.
+        provable: Whether the actual byte content can be proven from the available files. Zero ranges are always
+            provable; ranges that need a missing backing layer are not.
+        compression_type: Compression algorithm of a compressed cluster, or ``None`` for uncompressed ranges.
+        subcluster_type: Raw :class:`QCow2SubclusterType` of the run in the layer that defines it.
+    """
+
+    guest_offset: int
+    guest_length: int
+    source: QCow2MapSource
+    layer: int
+    evidence: BinaryIO | None = None
+    evidence_name: str | None = None
+    evidence_offset: int | None = None
+    evidence_length: int | None = None
+    granularity: int | None = None
+    provable: bool = True
+    compression_type: int | None = None
+    subcluster_type: QCow2SubclusterType | None = None
+
+    @property
+    def guest_range(self) -> tuple[int, int]:
+        """Return the covered guest range as a ``(offset, length)`` tuple."""
+        return (self.guest_offset, self.guest_length)
+
+    @property
+    def evidence_range(self) -> tuple[int, int] | None:
+        """Return the evidence range as a ``(offset, length)`` tuple, or ``None`` without an evidence file."""
+        if self.evidence_offset is None:
+            return None
+        return (self.evidence_offset, self.evidence_length)
+
+    def __repr__(self) -> str:
+        if self.evidence_name is None or self.evidence_offset is None or self.evidence_length is None:
+            evidence = "no evidence"
+        else:
+            evidence = f"{self.evidence_name}@{self.evidence_offset:#x}+{self.evidence_length:#x}"
+        return (
+            f"<QCow2Mapping guest=0x{self.guest_offset:x}+0x{self.guest_length:x} "
+            f"source={self.source.value} layer={self.layer} {evidence}>"
+        )
 
 
 class QCow2:
@@ -259,6 +338,22 @@ class QCow2:
             raise Error(f"backing-file required but not provided (auto_backing_file = {self.auto_backing_file!r})")
         return QCow2Stream(self)
 
+    def map_runs(self, offset: int = 0, length: int | None = None) -> Iterator[QCow2Mapping]:
+        """Yield the provenance of each logical run of a guest range.
+
+        This uses the exact same L1/L2 and subcluster mapping logic as reading the image, so every mapping describes
+        the file and range that :meth:`QCow2Stream.read` would actually use for those bytes. A backing file may be
+        absent, in which case the ranges that would need it are returned as unproven mappings instead of raising.
+
+        Args:
+            offset: First guest offset to map. Defaults to the start of the disk.
+            length: Number of guest bytes to map. Defaults to the remainder of the disk.
+
+        Yields:
+            QCow2Mapping: The provenance of a single contiguous logical run.
+        """
+        yield from QCow2Stream(self).map_runs(offset, self.size if length is None else length)
+
 
 class QCow2Snapshot:
     """Wrapper class for snapshot table entries."""
@@ -321,7 +416,7 @@ class QCow2Stream(AlignedStream):
             bytes_available = (self.qcow2.l2_size - l2_index) << self.qcow2.cluster_bits
             bytes_needed = min(bytes_needed, bytes_available)
 
-            if l1_index > self.qcow2.header.l1_size:
+            if l1_index >= self.qcow2.header.l1_size:
                 # bytes_needed is already the smaller value here
                 read_count = bytes_needed - offset_in_cluster
 
@@ -368,11 +463,7 @@ class QCow2Stream(AlignedStream):
 
     def _read_compressed(self, cluster_descriptor: int, offset: int, length: int) -> bytes:
         offset_in_cluster = offset_into_cluster(self.qcow2, offset)
-        coffset = cluster_descriptor & self.qcow2.cluster_offset_mask
-        nb_csectors = ((cluster_descriptor >> self.qcow2.csize_shift) & self.qcow2.csize_mask) + 1
-        # Original source uses the mask ~(~(QCOW2_COMPRESSED_SECTOR_SIZE - 1ULL))
-        # However bit inversion is weird in Python, and this evaluates to 511, so we use that value instead.
-        csize = nb_csectors * c_qcow2.QCOW2_COMPRESSED_SECTOR_SIZE - (coffset & 511)
+        coffset, csize = parse_compressed_descriptor(self.qcow2, cluster_descriptor)
 
         self.qcow2.fh.seek(coffset)
         buf = self.qcow2.fh.read(csize)
@@ -410,6 +501,111 @@ class QCow2Stream(AlignedStream):
 
         return b"".join(result)
 
+    def map_runs(self, offset: int, length: int, layer: int = 0) -> Iterator[QCow2Mapping]:
+        """Yield the provenance of each logical run of a guest range.
+
+        The runs are produced by :meth:`_yield_runs`, the same iterator that backs :meth:`_read`, so a mapping always
+        points at the exact file and range that reading the guest bytes would use. Ranges that are not defined by
+        this image are resolved against the backing chain; if a backing layer is missing, the ranges that would need
+        it are returned as :attr:`QCow2MapSource.UNKNOWN` mappings with ``provable=False`` instead of raising.
+
+        Args:
+            offset: First guest offset to map.
+            length: Number of guest bytes to map.
+            layer: Position of this image in the backing chain, where ``0`` is the top image.
+
+        Yields:
+            QCow2Mapping: The provenance of a single contiguous logical run.
+        """
+        for sc_type, read_offset, run_offset, run_length in self._yield_runs(offset, length):
+            yield from self._map_run(sc_type, read_offset, run_offset, run_length, layer)
+
+    def _map_run(
+        self,
+        sc_type: QCow2SubclusterType,
+        read_offset: int,
+        run_offset: int,
+        run_length: int,
+        layer: int,
+    ) -> Iterator[QCow2Mapping]:
+        if sc_type in ZERO_SUBCLUSTER_TYPES:
+            yield QCow2Mapping(
+                guest_offset=read_offset,
+                guest_length=run_length,
+                source=QCow2MapSource.ZERO,
+                layer=layer,
+                granularity=self.qcow2.subcluster_size,
+                subcluster_type=sc_type,
+            )
+            return
+
+        if sc_type in UNALLOCATED_SUBCLUSTER_TYPES:
+            backing_file = self.qcow2.backing_file
+            if backing_file is None:
+                # The image declares a backing file that is not available: the content of these bytes is unknown.
+                # Without a backing file at all, unallocated clusters are defined to read back as zero.
+                source = QCow2MapSource.UNKNOWN if self.qcow2.needs_backing_file else QCow2MapSource.UNALLOCATED_ZERO
+                yield QCow2Mapping(
+                    guest_offset=read_offset,
+                    guest_length=run_length,
+                    source=source,
+                    layer=layer,
+                    granularity=self.qcow2.subcluster_size,
+                    provable=not self.qcow2.needs_backing_file,
+                    subcluster_type=sc_type,
+                )
+                return
+
+            if isinstance(backing_file, QCow2Stream):
+                yield from backing_file.map_runs(read_offset, run_length, layer + 1)
+            else:
+                yield QCow2Mapping(
+                    guest_offset=read_offset,
+                    guest_length=run_length,
+                    source=QCow2MapSource.BACKING,
+                    layer=layer + 1,
+                    evidence=backing_file,
+                    evidence_name=getattr(backing_file, "name", None),
+                    evidence_offset=read_offset,
+                    evidence_length=run_length,
+                    granularity=1,
+                    subcluster_type=sc_type,
+                )
+            return
+
+        if sc_type == QCow2SubclusterType.QCOW2_SUBCLUSTER_COMPRESSED:
+            coffset, csize = parse_compressed_descriptor(self.qcow2, run_offset)
+            yield QCow2Mapping(
+                guest_offset=read_offset,
+                guest_length=run_length,
+                source=QCow2MapSource.COMPRESSED,
+                layer=layer,
+                evidence=self.qcow2.fh,
+                evidence_name=getattr(self.qcow2.fh, "name", None),
+                evidence_offset=coffset,
+                evidence_length=csize,
+                # Compression maps a whole cluster: partial reads still decompress the entire compressed cluster.
+                granularity=self.qcow2.cluster_size,
+                compression_type=self.qcow2.compression_type,
+                subcluster_type=sc_type,
+            )
+            return
+
+        # QCow2SubclusterType.QCOW2_SUBCLUSTER_NORMAL
+        data_file = self.qcow2.data_file
+        yield QCow2Mapping(
+            guest_offset=read_offset,
+            guest_length=run_length,
+            source=QCow2MapSource.DATA,
+            layer=layer,
+            evidence=data_file,
+            evidence_name=getattr(data_file, "name", None),
+            evidence_offset=run_offset,
+            evidence_length=run_length,
+            granularity=self.qcow2.subcluster_size,
+            subcluster_type=sc_type,
+        )
+
 
 class L2Table:
     """Convenience class for accessing the L2 table."""
@@ -433,6 +629,20 @@ class L2Table:
 
 def offset_into_cluster(qcow2: QCow2, offset: int) -> int:
     return offset & (qcow2.cluster_size - 1)
+
+
+def parse_compressed_descriptor(qcow2: QCow2, cluster_descriptor: int) -> tuple[int, int]:
+    """Parse a compressed L2 descriptor into its ``(host_offset, compressed_size)`` tuple.
+
+    A compressed entry references a whole guest cluster, so the mapping granularity is always a full cluster even
+    when only part of the cluster is read.
+    """
+    coffset = cluster_descriptor & qcow2.cluster_offset_mask
+    nb_csectors = ((cluster_descriptor >> qcow2.csize_shift) & qcow2.csize_mask) + 1
+    # Original source uses the mask ~(~(QCOW2_COMPRESSED_SECTOR_SIZE - 1ULL))
+    # However bit inversion is weird in Python, and this evaluates to 511, so we use that value instead.
+    csize = nb_csectors * c_qcow2.QCOW2_COMPRESSED_SECTOR_SIZE - (coffset & 511)
+    return coffset, csize
 
 
 def offset_into_subcluster(qcow2: QCow2, offset: int) -> int:
@@ -525,19 +735,31 @@ def get_subcluster_range_type(
     if not qcow2.has_subclusters or sc_type == QCow2SubclusterType.QCOW2_SUBCLUSTER_COMPRESSED:
         return sc_type, qcow2.subclusters_per_cluster - sc_from
 
-    sc_mask = (1 << sc_from) - 1
-    if sc_type == QCow2SubclusterType.QCOW2_SUBCLUSTER_NORMAL:
-        val = l2_bitmap | sc_mask  # QCOW_OFLAG_SUB_ALLOC_RANGE(0, sc_from)
-        return sc_type, ctz(val) - sc_from
-    if sc_type in ZERO_SUBCLUSTER_TYPES:
-        val = (l2_bitmap | sc_mask) >> 32  # QCOW_OFLAG_SUB_ZERO_RANGE(0, sc_from)
-        return sc_type, ctz(val) - sc_from
-    if sc_type in UNALLOCATED_SUBCLUSTER_TYPES:
-        # We need to mask it with a 64bit mask because Python flips the sign bit
-        inv_mask = ~sc_mask & ((1 << 64) - 1)  # ~QCOW_OFLAG_SUB_ALLOC_RANGE(0, sc_from)
+    # QEMU uses ctz32 here, which returns 32 for a zero value and operates on the low 32 bits
+    def ctz32(value: int) -> int:
+        value &= 0xFFFFFFFF
+        return (value & -value).bit_length() - 1 if value else 32
 
-        val = ((l2_bitmap >> 32) | l2_bitmap) & inv_mask
-        return sc_type, ctz(val) - sc_from
+    # Ignore every subcluster preceding sc_from by clearing their bits in the failure bitmap
+    inv_mask = ~((1 << sc_from) - 1) & 0xFFFFFFFF
+    if sc_type == QCow2SubclusterType.QCOW2_SUBCLUSTER_NORMAL:
+        # The run ends at the first non-allocated subcluster
+        val = (~l2_bitmap) & inv_mask  # ~QCOW_OFLAG_SUB_ALLOC_RANGE
+        return sc_type, ctz32(val) - sc_from
+    if sc_type in ZERO_SUBCLUSTER_TYPES:
+        # The run ends at the first non-zero subcluster
+        val = (~(l2_bitmap >> 32)) & inv_mask  # ~QCOW_OFLAG_SUB_ZERO_RANGE
+        return sc_type, ctz32(val) - sc_from
+    if sc_type in UNALLOCATED_SUBCLUSTER_TYPES:
+        # The run ends at the first allocated or zero subcluster. An unallocated cluster can only
+        # have zero subclusters, so for that variant the allocation bitmap is guaranteed to be empty.
+        if sc_type == QCow2SubclusterType.QCOW2_SUBCLUSTER_UNALLOCATED_PLAIN:
+            boundary_bitmap = l2_bitmap >> 32
+        else:
+            boundary_bitmap = l2_bitmap | (l2_bitmap >> 32)
+
+        val = boundary_bitmap & inv_mask
+        return sc_type, ctz32(val) - sc_from
 
     raise Error(f"Invalid subcluster type: {sc_type}")
 
@@ -559,7 +781,7 @@ def count_contiguous_subclusters(
     for i in range(nb_clusters):
         first_sc = sc_index if i == 0 else 0
         l2_entry = l2_table.entry(l2_index + i)
-        l2_bitmap = l2_table.entry(l2_index + i)
+        l2_bitmap = l2_table.bitmap(l2_index + i)
 
         sc_type, sc_count = get_subcluster_range_type(qcow2, l2_entry, l2_bitmap, first_sc)
 
